@@ -1,0 +1,56 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v3
+
+      - name: Install dependencies
+        run: |
+          uv venv
+          source .venv/bin/activate
+          uv pip install cadquery numpy matplotlib
+
+      - name: Generate model
+        run: |
+          source .venv/bin/activate
+          python designs/parametric_model.py
+
+      - name: Run printability analysis
+        run: |
+          source .venv/bin/activate
+          python designs/printability.py
+
+      - name: Run flight simulation
+        run: |
+          source .venv/bin/activate
+          python simulation/flight_sim.py
+
+      - name: Run electronics tests
+        run: |
+          source .venv/bin/activate
+          python electronics/flight_controller.py
+          python electronics/power_distribution.py
+          python electronics/motor_controller.py
+          python electronics/telemetry.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: model-outputs
+          path: out/

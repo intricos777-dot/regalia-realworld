@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+out/*.STL
+out/*.STEP
+out/*.npy
+out/preview_*.png
+*.egg-info/
+dist/
+build/
