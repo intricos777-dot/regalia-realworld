@@ -1,3 +1,4 @@
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # scripts/render_preview.py
 """Render the exported .STL to a few 3-D PNG views so I can eyeball the model."""
 import os

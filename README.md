@@ -1,3 +1,4 @@
+<!-- Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work -->
 # Regalia Real-World Equivalent — Flying Car
 
 A parametric, 3D-printable flying car inspired by the **Regalia** from *Final Fantasy XV* (also appearing as a mount in *Final Fantasy XIV*). This repository contains the complete engineering architecture: parametric CAD model, printability analysis, flight control backend, power distribution, telemetry, and simulation.

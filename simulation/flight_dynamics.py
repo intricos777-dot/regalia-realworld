@@ -1,3 +1,4 @@
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # simulation/flight_dynamics.py
 """6-DOF flight dynamics model for the Regalia flying car.
 

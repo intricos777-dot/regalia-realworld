@@ -1,3 +1,4 @@
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # designs/parametric_model.py
 """Parametric 3D model of a real-world flying car (Regalia, FFXV equivalent).
 

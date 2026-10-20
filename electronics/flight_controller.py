@@ -1,3 +1,4 @@
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # electronics/flight_controller.py
 """Flight control computer (FCC) backend for the Regalia flying car.
 

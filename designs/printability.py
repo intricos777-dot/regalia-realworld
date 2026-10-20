@@ -1,3 +1,4 @@
+# Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
 # designs/printability.py
 """Printability analysis for the Regalia flying car model.
 
