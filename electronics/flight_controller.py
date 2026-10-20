@@ -1,15 +1,23 @@
 # Watermark: Living_Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
+# Copyright (c) 2026 Living Sin (intricos777-dot) + AI agents (Hermes, Lia, opencode) - collaborative work
+# Licensed under Living Sin Proprietary License (LSPL-1.0)
+# See LICENSE file for details.
 # electronics/flight_controller.py
 """Flight control computer (FCC) backend for the Regalia flying car.
 
 Implements PID control loops for attitude, altitude, and heading.
 Triple-redundant architecture with voting logic.
+
+Modes:
+- road   : gear down, everything stowed
+- vtol   : altitude cascade + differential thrust roll + fan vectoring
+- cruise  : airspeed/pitch hold + aerodynamic control surfaces
 """
 
-import time
 import math
-from dataclasses import dataclass, field
-from typing import List, Tuple
+import time
+from dataclasses import dataclass
+from typing import List
 
 
 @dataclass
@@ -46,8 +54,25 @@ class ControlOutput:
     aileron_right: float = 0.0   # -1 to 1
     elevator: float = 0.0        # -1 to 1
     rudder: float = 0.0          # -1 to 1
+    # Normalised attitude commands for thrust-vectoring allocation (-1..1)
+    pitch_cmd: float = 0.0
+    yaw_cmd: float = 0.0
     gear_deploy: bool = False
     wing_deploy: bool = False
+
+    def to_control_input(self):
+        """Map to a dynamics ControlInput (simulation.flight_dynamics)."""
+        from simulation.flight_dynamics import ControlInput
+        return ControlInput(
+            lift_fan_left=self.lift_fan_left,
+            lift_fan_right=self.lift_fan_right,
+            pusher_fan=self.pusher_fan,
+            aileron=(self.aileron_right - self.aileron_left) / 2.0,
+            elevator=self.elevator,
+            rudder=self.rudder,
+            pitch_cmd=self.pitch_cmd,
+            yaw_cmd=self.yaw_cmd,
+        )
 
 
 class PIDController:
@@ -56,12 +81,14 @@ class PIDController:
     def __init__(self, gains: PIDGains):
         self.gains = gains
         self.integral = 0.0
-        self.prev_error = 0.0
+        # None until the first sample: avoids a derivative kick from a
+        # bogus initial "previous measurement".
+        self.prev_error = None
         self.prev_time = None
 
     def reset(self):
         self.integral = 0.0
-        self.prev_error = 0.0
+        self.prev_error = None
         self.prev_time = None
 
     def update(self, setpoint: float, measurement: float, dt: float = None) -> float:
@@ -87,7 +114,7 @@ class PIDController:
 
             # Derivative (on measurement, not error, to avoid derivative kick)
             d_term = 0.0
-            if self.prev_error is not None and dt > 0:
+            if self.prev_error is not None:
                 d_term = -self.gains.kd * (measurement - self.prev_error) / dt
             self.prev_error = measurement
 
@@ -100,24 +127,31 @@ class PIDController:
 class FlightController:
     """Main flight control computer."""
 
+    # Vehicle constants (mirror simulation.flight_dynamics.VehicleParams)
+    mass_kg: float = 1600.0
+    lift_fan_thrust_n: float = 12000.0
+    wing_area_m2: float = 8.5
+    cl_alpha: float = 5.0
+    rho: float = 1.225
+
     def __init__(self):
-        # Attitude controllers
-        self.roll_pid = PIDController(PIDGains(kp=2.0, ki=0.1, kd=0.3))
-        self.pitch_pid = PIDController(PIDGains(kp=2.0, ki=0.1, kd=0.3))
-        self.yaw_pid = PIDController(PIDGains(kp=1.5, ki=0.05, kd=0.2))
+        # Attitude controllers (outer loop, degrees)
+        self.roll_pid = PIDController(PIDGains(kp=0.08, ki=0.005, kd=0.02))
+        self.pitch_pid = PIDController(PIDGains(kp=0.08, ki=0.005, kd=0.02))
+        self.yaw_pid = PIDController(PIDGains(kp=0.06, ki=0.004, kd=0.02))
 
-        # Rate controllers (inner loop)
-        self.roll_rate_pid = PIDController(PIDGains(kp=0.8, ki=0.02, kd=0.1))
-        self.pitch_rate_pid = PIDController(PIDGains(kp=0.8, ki=0.02, kd=0.1))
-        self.yaw_rate_pid = PIDController(PIDGains(kp=0.6, ki=0.01, kd=0.05))
+        # Altitude cascade (outer=alt->vs, inner=vs->throttle %)
+        self.altitude_pid = PIDController(
+            PIDGains(kp=0.2, ki=0.02, kd=0.3, integral_limit=50.0, output_limit=5.0))
+        self.vertical_speed_pid = PIDController(
+            PIDGains(kp=2.0, ki=0.3, kd=0.1, integral_limit=50.0, output_limit=35.0))
 
-        # Altitude hold (cascade: outer loop = vertical speed, inner = throttle)
-        self.altitude_pid = PIDController(PIDGains(kp=0.08, ki=0.005, kd=0.15))
-        self.vertical_speed_pid = PIDController(PIDGains(kp=0.8, ki=0.05, kd=0.0))
-        self.hover_throttle = 65.0  # % throttle for level hover (1600kg, 2x12000N)
+        # Airspeed control (cruise pusher)
+        self.airspeed_pid = PIDController(
+            PIDGains(kp=0.6, ki=0.05, kd=0.1, integral_limit=50.0, output_limit=70.0))
 
-        # Airspeed control (separate from pitch attitude)
-        self.airspeed_pid = PIDController(PIDGains(kp=0.1, ki=0.01, kd=0.05))
+        # Derived hover throttle: balances weight on two lift fans
+        self.hover_throttle = self.mass_kg * 9.81 / (2.0 * self.lift_fan_thrust_n) * 100.0
 
         # State
         self.state = VehicleState()
@@ -128,6 +162,7 @@ class FlightController:
         self.target_altitude = 0.0
         self.target_heading = 0.0
         self.target_airspeed = 0.0
+        self.target_pitch = 8.0  # degrees, cruise trim AoA for wing lift
 
     def set_mode(self, mode: str):
         if mode not in ("road", "vtol", "cruise"):
@@ -144,6 +179,61 @@ class FlightController:
     def update_state(self, state: VehicleState):
         self.state = state
 
+    def _compute_vtol(self, s: VehicleState, out: ControlOutput, dt: float):
+        """VTOL: altitude cascade + differential thrust roll + vectoring."""
+        out.gear_deploy = False
+        out.wing_deploy = False
+
+        # Outer loop: altitude -> target vertical speed
+        target_vs = self.altitude_pid.update(self.target_altitude, s.altitude, dt)
+        # Inner loop: vertical speed -> throttle
+        vs_cmd = self.vertical_speed_pid.update(target_vs, s.vertical_speed, dt)
+        base = max(0.0, min(100.0, self.hover_throttle + vs_cmd))
+
+        # Roll via differential thrust: right fan > left fan -> roll left,
+        # so right = base - roll_cmd, left = base + roll_cmd (roll_cmd = -kp*roll).
+        roll_cmd = self.roll_pid.update(0.0, s.roll, dt)
+        out.lift_fan_left = max(0.0, min(100.0, base + roll_cmd * 20.0))
+        out.lift_fan_right = max(0.0, min(100.0, base - roll_cmd * 20.0))
+
+        # Pitch and yaw via fan vectoring (VTOL attitude authority)
+        out.pitch_cmd = self.pitch_pid.update(0.0, s.pitch, dt)
+        out.yaw_cmd = self.yaw_pid.update(self.target_heading, s.yaw, dt)
+
+        # Pusher off in VTOL; no aerodynamic surfaces (no airflow)
+        out.pusher_fan = 0.0
+
+    def _compute_cruise(self, s: VehicleState, out: ControlOutput, dt: float):
+        """Cruise: adaptive lift split + airspeed/pitch hold + aero surfaces."""
+        out.gear_deploy = False
+        out.wing_deploy = True
+
+        # Wing lift share of weight at current speed and pitch
+        weight = self.mass_kg * 9.81
+        q_bar = 0.5 * self.rho * s.airspeed ** 2
+        alpha_rad = math.radians(max(0.0, s.pitch))
+        wing_lift = q_bar * self.wing_area_m2 * self.cl_alpha * alpha_rad
+        wing_frac = max(0.0, min(0.5, wing_lift / weight))
+        fan_throttle = max(0.0, min(100.0, self.hover_throttle * (1.0 - wing_frac)))
+        out.lift_fan_left = fan_throttle
+        out.lift_fan_right = fan_throttle
+
+        # Airspeed -> pusher fan
+        spd_cmd = self.airspeed_pid.update(self.target_airspeed, s.airspeed, dt)
+        out.pusher_fan = max(0.0, min(100.0, 25.0 + spd_cmd))
+
+        # Altitude hold biases the pitch target
+        alt_err = self.target_altitude - s.altitude
+        pitch_bias = max(-5.0, min(5.0, 0.05 * alt_err))
+        pitch_cmd = self.pitch_pid.update(self.target_pitch + pitch_bias, s.pitch, dt)
+        roll_cmd = self.roll_pid.update(0.0, s.roll, dt)
+        yaw_cmd = self.yaw_pid.update(self.target_heading, s.yaw, dt)
+
+        out.aileron_left = max(-1.0, min(1.0, -roll_cmd))
+        out.aileron_right = max(-1.0, min(1.0, roll_cmd))
+        out.elevator = max(-1.0, min(1.0, pitch_cmd))
+        out.rudder = max(-1.0, min(1.0, yaw_cmd))
+
     def compute(self, dt: float = 0.01) -> ControlOutput:
         """Main control computation. Returns control outputs."""
         if not self.armed:
@@ -153,88 +243,46 @@ class FlightController:
         s = self.state
 
         if self.mode == "road":
-            # Road mode: everything stowed
             out.gear_deploy = True
             out.wing_deploy = False
             return out
-
         elif self.mode == "vtol":
-            # VTOL: cascade altitude control (outer=alt, inner=vertical speed)
-            out.gear_deploy = False
-            out.wing_deploy = False
-
-            # Outer loop: altitude -> target vertical speed
-            target_vs = max(-3.0, min(3.0, self.altitude_pid.update(self.target_altitude, s.altitude, dt)))
-
-            # Inner loop: vertical speed -> throttle adjustment
-            vs_cmd = self.vertical_speed_pid.update(target_vs, s.vertical_speed, dt)
-            base_throttle = self.hover_throttle + vs_cmd * 5.0
-            base_throttle = max(0.0, min(100.0, base_throttle))
-
-            # Roll control -> differential thrust
-            roll_cmd = self.roll_pid.update(0.0, s.roll, dt)
-            out.lift_fan_left = max(0, min(100, base_throttle - roll_cmd * 20))
-            out.lift_fan_right = max(0, min(100, base_throttle + roll_cmd * 20))
-
-            # Pitch control -> differential (forward fans vs rear)
-            pitch_cmd = self.pitch_pid.update(0.0, s.pitch, dt)
-
-            # Yaw control -> differential thrust left/right
-            yaw_cmd = self.yaw_pid.update(self.target_heading, s.yaw, dt)
-
-            # Pusher fan off in VTOL
-            out.pusher_fan = 0.0
-
+            self._compute_vtol(s, out, dt)
         elif self.mode == "cruise":
-            # Cruise: wings deployed, pusher fan provides forward thrust
-            out.gear_deploy = False
-            out.wing_deploy = True
-
-            # Airspeed control -> pusher fan throttle (separate PID)
-            spd_cmd = self.airspeed_pid.update(self.target_airspeed, s.airspeed, dt)
-            out.pusher_fan = max(0, min(100, 30.0 + spd_cmd * 10))
-
-            # Lift fans supplement wing lift (wing provides ~13% at 30 m/s)
-            out.lift_fan_left = 57.0
-            out.lift_fan_right = 57.0
-
-            # Roll/pitch/yaw control surfaces
-            roll_cmd = self.roll_pid.update(0.0, s.roll, dt)
-            pitch_cmd = self.pitch_pid.update(0.0, s.pitch, dt)
-            yaw_cmd = self.yaw_pid.update(self.target_heading, s.yaw, dt)
-
-            out.aileron_left = max(-1, min(1, -roll_cmd))
-            out.aileron_right = max(-1, min(1, roll_cmd))
-            out.elevator = max(-1, min(1, pitch_cmd))
-            out.rudder = max(-1, min(1, yaw_cmd))
+            self._compute_cruise(s, out, dt)
 
         return out
 
 
 class RedundantFCC:
-    """Triple-redundant flight control with voting."""
+    """Triple-redundant flight control with median voting on all outputs."""
+
+    # Fields on ControlOutput that are voted on
+    _VOTE_FIELDS = (
+        "lift_fan_left", "lift_fan_right", "pusher_fan",
+        "aileron_left", "aileron_right", "elevator", "rudder",
+        "pitch_cmd", "yaw_cmd",
+    )
 
     def __init__(self):
         self.channels = [FlightController() for _ in range(3)]
         self.active_channel = 0
 
-    def compute(self) -> ControlOutput:
-        """Compute using all 3 channels, vote on outputs."""
-        outputs = [ch.compute() for ch in self.channels]
-
-        # Simple median voting on lift fan throttle
-        left_throttles = sorted([o.lift_fan_left for o in outputs])
-        right_throttles = sorted([o.lift_fan_right for o in outputs])
-        pusher_throttles = sorted([o.pusher_fan for o in outputs])
-
-        # Use median channel
-        median_idx = 1
-        result = outputs[median_idx]
-        result.lift_fan_left = left_throttles[1]
-        result.lift_fan_right = right_throttles[1]
-        result.pusher_fan = pusher_throttles[1]
-
+    def compute(self, dt: float = 0.01) -> ControlOutput:
+        """Compute on all 3 channels, take median of each output field."""
+        outputs = [ch.compute(dt) for ch in self.channels]
+        result = outputs[0]
+        for field in self._VOTE_FIELDS:
+            values = sorted(getattr(o, field) for o in outputs)
+            setattr(result, field, values[1])
+        # Discrete outputs come from the majority channel (channel 0).
+        result.gear_deploy = outputs[0].gear_deploy
+        result.wing_deploy = outputs[0].wing_deploy
         return result
+
+    def set_mode(self, mode: str):
+        for ch in self.channels:
+            ch.set_mode(mode)
 
     def update_all_states(self, state: VehicleState):
         for ch in self.channels:
@@ -245,12 +293,13 @@ class RedundantFCC:
 if __name__ == "__main__":
     fc = FlightController()
     fc.armed = True
+    print(f"Hover throttle: {fc.hover_throttle:.1f}%")
 
     for mode in ("road", "vtol", "cruise"):
         fc.set_mode(mode)
         fc.target_altitude = 100.0
         fc.target_heading = 90.0
-        fc.target_airspeed = 30.0
+        fc.target_airspeed = 20.0
 
         state = VehicleState(
             roll=5.0, pitch=-3.0, yaw=88.0,
@@ -263,5 +312,6 @@ if __name__ == "__main__":
         print(f"  Lift L: {out.lift_fan_left:.1f}%  Lift R: {out.lift_fan_right:.1f}%  "
               f"Pusher: {out.pusher_fan:.1f}%")
         print(f"  Aileron L: {out.aileron_left:.2f}  R: {out.aileron_right:.2f}  "
-              f"Elevator: {out.elevator:.2f}  Rudder: {out.rudder:.2f}")
+              f"Elevator: {out.elevator:.2f}  Rudder: {out.rudder:.2f}  "
+              f"PitchCmd: {out.pitch_cmd:.2f}  YawCmd: {out.yaw_cmd:.2f}")
         print()
